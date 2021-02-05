@@ -1,5 +1,7 @@
 FROM node
 
+RUN rm /etc/localtime && ln -s /usr/share/zoneinfo/Europe/Stockholm /etc/localtime
+
 RUN apt-get update && apt-get install -y \
     apt-transport-https \
     ca-certificates \

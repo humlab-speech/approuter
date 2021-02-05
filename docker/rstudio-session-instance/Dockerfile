@@ -1,5 +1,7 @@
 FROM rocker/rstudio:3.6.3
 
+rm /etc/localtime && ln -s /usr/share/zoneinfo/Europe/Stockholm /etc/localtime
+
 #zlib is needed to build the R git2r lib, which is a dependency of emuR
 RUN apt-get update && apt-get install -y zlib1g-dev nano
 
