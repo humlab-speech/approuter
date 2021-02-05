@@ -3,11 +3,12 @@ const child_process = require('child_process');
 const httpProxy = require('http-proxy');
 
 class Session {
-    constructor(user, project, port) {
+    constructor(user, project, port, hsApp) {
         this.user = user;
         this.project = project;
         this.port = port;
         this.port = 8787;
+        this.hsApp = hsApp;
         this.accessCode = nanoid.nanoid(32);
         this.fullDockerContainerId = null;
         this.shortDockerContainerId = null;
