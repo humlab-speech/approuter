@@ -1,18 +1,101 @@
 const nanoid = require('nanoid');
 const child_process = require('child_process');
 const httpProxy = require('http-proxy');
+const { Docker } = require('node-docker-api');
 
 class Session {
-    constructor(user, project, port, hsApp) {
+    constructor(app, user, project, port, hsApp) {
+        this.app = app;
         this.user = user;
         this.project = project;
         this.port = port;
         this.port = 8787;
         this.hsApp = hsApp;
-        this.accessCode = nanoid.nanoid(32);
+        this.accessCode = nanoid.nanoid(32); //This should be phased out in favor of "sessionCode"
+        this.sessionCode = null; //This is identical to the container ID, thus if it is null, there's no container running for this session
         this.fullDockerContainerId = null;
         this.shortDockerContainerId = null;
         this.rstudioImageName = "hird-rstudio-emu";
+        this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
+    }
+
+    setAccessCode(code) {
+        this.accessCode = code;
+    }
+
+    promisifyStream(stream) {
+        let streamData = "";
+        return new Promise((resolve, reject) => {
+          stream.on('data', data => {
+            this.app.addLog("Stream data:"+data.toString());
+            streamData += data.toString();
+          });
+          stream.on('end', resolve);
+          stream.on('error', reject);
+        });
+    }
+
+    async runCommand(cmd) {
+        if(!Array.isArray(cmd)) {
+            cmd = [cmd];
+        }
+        
+        let cmdFlat = "";
+        cmd.map((value) => {
+            cmdFlat += value+" ";
+        })
+
+        this.app.addLog("Executing command in session container: "+cmdFlat);
+
+        return new Promise((resolve, reject) => {
+            return this.container.exec.create({
+                AttachStdout: true,
+                AttachStderr: true,
+                Cmd: cmd
+            })
+            .then((exec) => {
+                return exec.start({ Detach: false })
+            })
+            .then(stream => {
+                this.promisifyStream(stream).then((data) => {
+                    resolve(data);
+                });
+            })
+            .catch((error) => this.app.addLog(error, "error"));
+        });
+    }
+
+    /**
+     * Function: loadContainerId
+     * This is used to lookup/load the container ID during import of a running session/container, in which case only the userId, projectId and hsApp is known.
+     */
+    async loadContainerId() {
+        await new Promise((resolve, reject) => {
+            this.docker.container.list().then(containers => {
+                let filteredList = containers.filter((container) => {
+                    return container.data.Image == "hird-rstudio-emu";
+                });
+    
+                let containerId = false;
+                filteredList.forEach((c) => {
+                    let hsApp = c.data.Labels['hs.hsApp'];
+                    let userId = c.data.Labels['hs.userId'];
+                    let projectId = c.data.Labels['hs.projectId'];
+                    if(this.hsApp == hsApp && userId == 34 && projectId == 206) {
+                            containerId = c.id;
+                    }
+                });
+                if(containerId !== false) {
+                    this.importContainerId(containerId);
+                }
+                else {
+                    this.app.addLog("Failed to find session container!", "error");
+                }
+                resolve();
+            });
+        });
+
+        return this.shortDockerContainerId;
     }
 
     getContainerName(userId, projectId) {
@@ -20,165 +103,117 @@ class Session {
         return "rstudio-session-p"+projectId+"u"+userId+"-"+salt;
     }
 
-    async createContainer() {
-        console.log("Creating new project container");
-
-        let sessionWsPort = 17890;
-        // -p "+sessionWsPort+":17890
-        let cmd = "docker run --rm -e DISABLE_AUTH=true --network humlab-speech-deployment_hird-net --name "+this.getContainerName(this.user.id, this.project.id)+" -d "+this.rstudioImageName;
-            
-        let dockerContainerId = null;
-        try {
-            dockerContainerId = child_process.execSync(cmd);
-        }
-        catch(e) {
-            console.log("Error:", e);
-        }
+    importContainerId(dockerContainerId) {
         this.fullDockerContainerId = dockerContainerId.toString('utf8');
         this.shortDockerContainerId = this.fullDockerContainerId.substring(0, 12);
+        this.accessCode = this.shortDockerContainerId;
+        this.app.addLog("Imported container ID "+this.shortDockerContainerId);
+    }
 
+    async createContainer() {
+        this.app.addLog("Creating new project container");
+
+        this.app.addLog(this.hsApp+" "+this.user.id+" "+this.project.id);
+
+        let dockerContainerId = null;
+        return await this.docker.container.create({
+            Image: this.rstudioImageName,
+            name: this.getContainerName(this.user.id, this.project.id),
+            Env: [
+                "DISABLE_AUTH=true"
+            ],
+            Labels: {
+                "hs.hsApp": this.hsApp.toString(),
+                "hs.userId": this.user.id.toString(),
+                "hs.projectId": this.project.id.toString(),
+                "hs.accessCode": this.accessCode.toString()
+            },
+            NetworkMode: "humlab-speech-deployment_hird-net"
+          })
+            .then(container => container.start())
+            .then(async (container) => {
+                dockerContainerId = container.data.Id;
+                this.container = container;
+                this.importContainerId(dockerContainerId);
+                this.app.addLog("Container ID is "+this.shortDockerContainerId);
+                this.app.addLog("Setting up proxy server");
+                await this.setupProxyServerIntoContainer(this.shortDockerContainerId);
+                this.app.addLog("Proxy server online");
+                return this.shortDockerContainerId;
+            })
+            .catch(error => this.app.addLog("Docker container failed to start: "+error, "error"));
+        
+    }
+
+    async setupProxyServerIntoContainer(shortDockerContainerId) {
         //Setting up proxy server
         this.proxyServer = httpProxy.createProxyServer({
-            target: "http://"+this.shortDockerContainerId+':8787',
+            target: "http://"+shortDockerContainerId+':8787',
             //port: 8787,
             ws: true
         });
 
         this.proxyServer.on('error', function (err, req, res) {
-            console.log("Proxy error!");
-            console.log(err);
+            this.app.addLog("Proxy error!");
+            this.app.addLog(err);
         });
 
         this.proxyServer.on('proxyReq', (err, req, res) => {
-            //console.log("Rstudio-router session proxy received request!");
+            this.app.addLog("Rstudio-router session proxy received request!");
         });
 
         this.proxyServer.on('proxyReqWs', (err, req, res) => {
-            console.log("Rstudio-router session proxy received ws request!");
+            this.app.addLog("Rstudio-router session proxy received ws request!");
             //Can we redirect this request to the 17890 port here?
         });
 
         this.proxyServer.on('upgrade', function (req, socket, head) {
-            console.log("Rstudio-router session proxy received upgrade!");
+            this.app.addLog("Rstudio-router session proxy received upgrade!");
             //this.proxyServer.proxy.ws(req, socket, head);
         });
-
-
-        //FIXME: Need a better way to check if container is ready than to just sleep for a while
-        await new Promise((resolve, reject) => {
-            setTimeout(() => {
-                console.log("New project container created");
-                resolve();
-            }, 3000);
-        });
-        
-        return this.shortDockerContainerId;
     }
 
+
+
     async cloneProjectFromGit() {
-        //2. git clone project into container
-        console.log("Cloning project into container");
+        this.app.addLog("Cloning project into container");
         let crendentials = "root:"+process.env.GIT_API_ACCESS_TOKEN;
         let gitRepoUrl = "http://"+crendentials+"@gitlab:80/"+this.project.path_with_namespace+".git";
         let targetPath = "/home/rstudio/project";
-        let cmd = "docker exec "+this.shortDockerContainerId+" git clone "+gitRepoUrl+" "+targetPath;
-        let output = child_process.execSync(cmd);
-
-        cmd = "docker exec "+this.shortDockerContainerId+" chown -R rstudio:rstudio "+targetPath;
-        child_process.execSync(cmd);
-
-        /*
-        cmd = "docker exec "+this.shortDockerContainerId+" echo 'library(emuR)' | /usr/local/bin/R";
-        child_process.execSync(cmd);
-        */
-
-        console.log("Project cloned into container");
-        output = output.toString('utf8');
-        return output;
+        await this.runCommand(["git", "clone", gitRepoUrl, targetPath]);
+        await this.runCommand(["chown", "-R", "rstudio:rstudio", targetPath]);
+        this.app.addLog("Project cloned into container");
     }
 
     async commit() {
-        console.log("Committing project");
-        //let crendentials = "root:"+process.env.GIT_API_ACCESS_TOKEN;
-        //let gitRepoUrl = "http://"+crendentials+"@gitlab:80/"+this.projectPath+".git";
-
-        
-        let cmd = "";
-        let output = "";
-        cmd = "docker exec -w /home/rstudio/project "+this.shortDockerContainerId+" git config --global user.email '"+this.user.email+"'";
-        console.log(cmd);
-        output = child_process.execSync(cmd);
-        console.log(output.toString('utf8'));
-
-        cmd = "docker exec -w /home/rstudio/project "+this.shortDockerContainerId+" git config --global user.name '"+this.user.name+"'";
-        console.log(cmd);
-        output = child_process.execSync(cmd);
-        console.log(output.toString('utf8'));
-        //docker exec 39d8b5d4dd4b bash -c "cd /home/rstudio/project && git commit -m 'hird-auto-commit' && git push"
-
-        cmd = "docker exec -w /home/rstudio/project "+this.shortDockerContainerId+" bash -c 'git add . && git commit -m \"system-auto-commit\" && git push'";
-        console.log(cmd);
-        output = child_process.exec(cmd, {}, (error, stdout, stderr) => {
-            if (error) {
-                console.error(`exec error: ${error}`);
-                //return;
-              }
-              console.log(`output: ${output}`);
-              console.log(`stdout: ${stdout}`);
-              console.error(`stderr: ${stderr}`);
-
-              //return output.toString('utf8');
+        this.app.addLog("Committing project");
+        await this.runCommand(["git", "config", "--global", "user.email", this.user.email]);
+        await this.runCommand(["git", "config", "--global", "user.name", this.user.name]);
+        await this.runCommand(["bash", "-c", "cd /home/rstudio/project && git add ."]);
+        await this.runCommand(["bash", "-c", "cd /home/rstudio/project && git commit -m 'system-auto-commit'"]);
+        await this.runCommand(["bash", "-c", "cd /home/rstudio/project && git push"]).then((cmdOutput) => {
+            this.app.addLog("cmdOutput:"+cmdOutput);
         });
         return this.accessCode;
-
-        /*
-        cmd = "docker exec -w /home/rstudio/project "+this.shortDockerContainerId+" git add .";
-        console.log(cmd);
-        output = child_process.execSync(cmd);
-        console.log(output.toString('utf8'));
-
-        //cmd = "bash -c docker exec -w /home/rstudio/project "+this.shortDockerContainerId+" git commit -m 'hird-auto-commit' && git push";
-        //cmd = "docker exec -w /home/rstudio/project "+this.shortDockerContainerId+" git commit -m 'hird-auto-commit'";
-        //cmd = "docker exec -w /home/rstudio/project "+this.shortDockerContainerId+" bash -c 'git commit -m hird-auto-commit'";
-        let params = [
-            "exec",
-            this.shortDockerContainerId,
-            "git commit -m 'hird-auto-commit'"
-        ];
-
-        output = child_process.spawnSync("docker", params, {
-            cwd: '/home/rstudio/project',
-            shell: true
-        });
-
-        console.log("A");d
-        console.log(output.output);
-        console.log("B");
-
-        cmd = "docker exec -w /home/rstudio/project "+this.shortDockerContainerId+" git push";
-        console.log(cmd);
-        output = child_process.execSync(cmd);
-        console.log(output.toString('utf8'));
-        
-
-        return output.toString('utf8');
-        */
     }
 
     async delete() {
-        console.log("Deleting session");
+        this.app.addLog("Deleting session "+this.accessCode);
         
         //This will stop new connections but not close existing ones
-        this.proxyServer.close();
+        try {
+            this.proxyServer.off("error");
+            this.proxyServer.off("proxyReq");
+            this.proxyServer.off("proxyReqWs");
+            this.proxyServer.off("upgrade");
+            this.proxyServer.close();
+        }
+        catch(error) {
+            this.app.addLog("Proxy server error at delete: "+error);
+        }
 
-        setTimeout(() => {
-            let cmd = "docker stop "+this.shortDockerContainerId;
-            console.log(cmd);
-            let output = child_process.execSync(cmd);
-            console.log(output.toString('utf8'));
-        }, 5000);
-
-        
+        await this.container.kill();
+        await this.container.delete();
         return this.accessCode;
     }
 };

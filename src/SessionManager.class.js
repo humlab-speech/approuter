@@ -1,13 +1,35 @@
 const child_process = require('child_process');
 const Session = require('./Session.class');
+const fetch = require('node-fetch');
+const { Docker } = require('node-docker-api');
 
 class SessionManager {
-    constructor() {
-        this.rstudioImageName = process.env.RSTUDIO_IMAGE_NAME
+    constructor(app) {
+      this.app = app;
+      this.rstudioImageName = process.env.RSTUDIO_IMAGE_NAME
+      this.sessions = [];
+      this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
+    }
+
+
+    getUserSessions(userId) {
+      this.app.addLog("Getting user sessions for user "+userId);
+      let userSessions = [];
+      for(let key in this.sessions) {
+        if(this.sessions[key].user.id == userId) {
+          userSessions.push({
+            sessionCode: this.sessions[key].accessCode,
+            projectId: this.sessions[key].project.id,
+            type: 'rstudio'
+          });
+        }
+      }
+      return userSessions;
     }
 
     createSession(user, project, hsApp = 'rstudio') {
-        let sess = new Session(user, project, this.getAvailableSessionProxyPort(), hsApp);
+        let sess = new Session(this.app, user, project, this.getAvailableSessionProxyPort(), hsApp);
+        this.sessions.push(sess);
         return sess;
     }
 
@@ -39,14 +61,14 @@ class SessionManager {
         let sess = this.getSessionByCode(sessionAccessCode);
         if(sess === false) {
             console.warn("Couldn't find a session with code", sessionAccessCode);
-            console.log(sessions);
+            this.app.addLog(this.sessions);
             return false;
         }
         
-        console.log("REQ:",req.url);
+        this.app.addLog("REQ:",req.url);
         
         if(ws) {
-            console.log("Performing websocket routing");
+            this.app.addLog("Performing websocket routing");
             sess.proxyServer.ws(req, socket, {
             target: "ws://localhost:17890",
             ws: true,
@@ -54,7 +76,7 @@ class SessionManager {
             });
         }
         else {
-            console.log("Performing http routing");
+            this.app.addLog("Performing http routing");
             sess.proxyServer.web(req, res);
         }
     }
@@ -67,15 +89,50 @@ class SessionManager {
 
     }
 
-    fetchActiveSessions() {
+    fetchActiveSessionsOLD() {
         let containers = this.getRunningSessions();
         return containers;
     }
+
+    /*
+    async fetchSessionContainers() {
+      return await docker.container.list()
+      .then((containers) => {
+          let filteredList = containers.filter((container) => {
+            return container.data.Image == "hird-rstudio-emu";
+          });
+
+          return filteredList;
+        });
+    }
+    */
       
     getSession(userId, projectId) {
+      for(let key in this.sessions) {
+        if(this.sessions[key].user.id == userId && this.sessions[key].project.id == projectId) {
+          return this.sessions[key];
+        }
+      }
+      return false;
     }
     
     getRunningContainers() {
+      /*
+      (async () => {
+        await docker.container.list()
+        .then((containers) => {
+            let filteredList = containers.filter((container) => {
+              return container.data.Image == "hird-rstudio-emu";
+            });
+
+            return filteredList;
+          });
+      })();
+
+      return await fetchSessionContainers();
+      */
+
+      /*
       let cmd = "docker ps --format='{{json .}}'";
       let dockerContainersJson = child_process.execSync(cmd).toString('utf8');
       let containersJson = dockerContainersJson.split("\n");
@@ -93,18 +150,21 @@ class SessionManager {
           });
         }
       });
+      this.sessions = sessions;
       return sessions;
+      */
     }
 
     getSessionByCode(code) {
-        let foundSession = false;
-        sessions.forEach((session) => {
-          if(session.accessCode == code) {
-            foundSession = session;
-          }
-        });
-        return foundSession;
+      code = code.toString('utf8');
+      for(let key in this.sessions) {
+        this.app.addLog(this.sessions[key].accessCode+" "+code);
+        if(this.sessions[key].accessCode == code) {
+          return this.sessions[key];
+        }
       }
+      return false;
+    }
 
     getAvailableSessionProxyPort() {
         let portMin = 30000;
@@ -113,8 +173,8 @@ class SessionManager {
         let selectedPortInUse = true;
         while(selectedPortInUse) {
           selectedPortInUse = false;
-          for(let key in sessions) {
-            if(sessions[key].port == selectedPort) {
+          for(let key in this.sessions) {
+            if(this.sessions[key].port == selectedPort) {
               selectedPortInUse = true;
             }
           }
@@ -135,47 +195,141 @@ class SessionManager {
       }
 
     removeSession(session) {
-        for(let i = sessions.length-1; i > -1; i--) {
-            if(sessions[i].accessCode == session.accessCode) {
-            sessions.splice(i, 1);
+        for(let i = this.sessions.length-1; i > -1; i--) {
+            if(this.sessions[i].accessCode == session.accessCode) {
+              this.sessions.splice(i, 1);
             }
         }
     }
-      
-    getUserSessions(userId) {
-        console.log("Getting user sessions for user", userId);
-        let userSessions = [];
-        for(let key in sessions) {
-            if(sessions[key].user.id == userId) {
-                userSessions.push({
-                sessionCode: sessions[key].accessCode,
-                projectId: sessions[key].project.id,
-                'type': 'rstudio'
-                });
-            }
-        }
-        return userSessions;
-      }
 
-    closeOrphanContainers() {
-        console.log("Closing any orphan session containers");
-        let containers = this.getRunningContainers();
-        containers.forEach((c) => {
-          deleteContainer = true;
-          sessions.forEach((s) => {
-            if(c.id == s.shortDockerContainerId) {
-              deleteContainer = false;
-            }
+    /**
+     * Function: importRunningContainers
+     * This is indented to import any existing running sessions, in case the cluster was restarted while sessians were active
+     */
+    async importRunningContainers() {
+      this.app.addLog("Importing existing session containers");
+
+      await new Promise((resolve, reject) => {
+
+        this.docker.container.list().then(containers => {
+          let filteredList = containers.filter((container) => {
+            return container.data.Image == "hird-rstudio-emu";
           });
-      
-          if(deleteContainer) {
-            let cmd = "docker stop "+c.id;
-            child_process.exec(cmd, {}, () => {
-              console.log("Stopped orphan container", c.id);
+  
+          let userIds = [];
+          let users = [];
+  
+          let projectIds = [];
+          let projects = [];
+  
+          let fetchPromises = [];
+  
+          filteredList.forEach((c) => {
+            let hsApp = c.data.Labels['hs.hsApp'];
+            let userId = c.data.Labels['hs.userId'];
+            let projectId = c.data.Labels['hs.projectId'];
+            let accessCode = c.data.Labels['hs.accessCode'];
+            
+  
+            //Only fetch if we are not already fetching info for this user
+            if(userIds.indexOf(userId) == -1) {
+              this.app.addLog("Fetching user "+userId);
+              userIds.push(userId);
+              let p = fetch(this.app.gitlabAddress+"/api/v4/users?id="+userId+"&private_token="+this.app.gitlabAccessToken)
+              .then(response => response.json())
+              .then(data => {
+                users.push(data[0]);
+              });
+  
+              fetchPromises.push(p);
+            }
+  
+            //Only fetch if we are not already fetching info for this project
+            if(projectIds.indexOf(projectId) == -1) {
+              this.app.addLog("Fetching project "+projectId);
+              projectIds.push(projectId);
+              let p = fetch(this.app.gitlabAddress+"/api/v4/projects?id="+projectId+"&private_token="+this.app.gitlabAccessToken)
+              .then(response => response.json())
+              .then(data => {
+                projects.push(data[0]);
+              });
+  
+              fetchPromises.push(p);
+            }
+            
+          });
+  
+          Promise.all(fetchPromises).then(data => {
+            this.app.addLog("Promises data:"+data);
+            filteredList.forEach((c) => {
+              let hsApp = c.data.Labels['hs.hsApp'];
+              let userId = c.data.Labels['hs.userId'];
+              let projectId = c.data.Labels['hs.projectId'];
+              let accessCode = c.data.Labels['hs.accessCode'];
+  
+              let userObj = null;
+              users.forEach(user => {
+                if(user.id == userId) {
+                  userObj = user;
+                }
+              });
+              let projObj = null;
+              projects.forEach(project => {
+                if(project.id == projectId) {
+                  projObj = project;
+                }
+              });
+  
+              this.app.addLog("Importing existing session: App:"+hsApp+" User:"+userObj.id+" Proj:"+projObj.id);
+              
+              let session = new Session(this.app, userObj, projObj, this.getAvailableSessionProxyPort(), hsApp);
+              session.setAccessCode(accessCode);
+              session.loadContainerId().then((shortDockerContainerId) => {
+                session.setupProxyServerIntoContainer(shortDockerContainerId);
+              });
+              
+              this.sessions.push(session);
+  
             });
+
+            resolve();
+          });
+  
+        });
+
+        
+      });
+
+      
+    }
+
+    /**
+     * Function: closeOrphanContainers
+     * WARNING: This has not been updated to use Docker API
+     */
+
+     /*
+    closeOrphanContainers() {
+      this.app.addLog("Closing any orphan session containers");
+
+      let containers = this.importRunningContainers();
+      containers.forEach((c) => {
+        deleteContainer = true;
+        this.sessions.forEach((s) => {
+          if(c.id == s.shortDockerContainerId) {
+            deleteContainer = false;
           }
         });
-      }
+    
+        if(deleteContainer) {
+          let cmd = "docker stop "+c.id;
+          child_process.exec(cmd, {}, () => {
+            this.app.addLog("Stopped orphan container", c.id);
+          });
+        }
+      });
+    }
+    */
 
 };
 
