@@ -11,7 +11,7 @@ class Session {
         this.port = port;
         this.port = 8787;
         this.hsApp = hsApp;
-        this.accessCode = nanoid.nanoid(32); //This should be phased out in favor of "sessionCode"
+        this.accessCode = this.app.sessMan.getContainerAccessCode();
         this.sessionCode = null; //This is identical to the container ID, thus if it is null, there's no container running for this session
         this.fullDockerContainerId = null;
         this.shortDockerContainerId = null;
@@ -81,7 +81,7 @@ class Session {
                     let hsApp = c.data.Labels['hs.hsApp'];
                     let userId = c.data.Labels['hs.userId'];
                     let projectId = c.data.Labels['hs.projectId'];
-                    if(this.hsApp == hsApp && userId == 34 && projectId == 206) {
+                    if(this.hsApp == hsApp && userId == this.user.id && projectId == this.project.id) {
                             containerId = c.id;
                     }
                 });
@@ -154,26 +154,23 @@ class Session {
         });
 
         this.proxyServer.on('error', function (err, req, res) {
-            this.app.addLog("Proxy error!");
-            this.app.addLog(err);
+            this.app.addLog("Proxy error: "+err, "error");
         });
 
         this.proxyServer.on('proxyReq', (err, req, res) => {
-            this.app.addLog("Rstudio-router session proxy received request!");
+            this.app.addLog("Rstudio-router session proxy received request!", "debug");
         });
 
         this.proxyServer.on('proxyReqWs', (err, req, res) => {
-            this.app.addLog("Rstudio-router session proxy received ws request!");
+            this.app.addLog("Rstudio-router session proxy received ws request!", "debug");
             //Can we redirect this request to the 17890 port here?
         });
 
         this.proxyServer.on('upgrade', function (req, socket, head) {
-            this.app.addLog("Rstudio-router session proxy received upgrade!");
+            this.app.addLog("Rstudio-router session proxy received upgrade!", "debug");
             //this.proxyServer.proxy.ws(req, socket, head);
         });
     }
-
-
 
     async cloneProjectFromGit() {
         this.app.addLog("Cloning project into container");
@@ -192,7 +189,7 @@ class Session {
         await this.runCommand(["bash", "-c", "cd /home/rstudio/project && git add ."]);
         await this.runCommand(["bash", "-c", "cd /home/rstudio/project && git commit -m 'system-auto-commit'"]);
         await this.runCommand(["bash", "-c", "cd /home/rstudio/project && git push"]).then((cmdOutput) => {
-            this.app.addLog("cmdOutput:"+cmdOutput);
+            this.app.addLog("Commit cmd output: "+cmdOutput, "debug");
         });
         return this.accessCode;
     }
@@ -209,7 +206,7 @@ class Session {
             this.proxyServer.close();
         }
         catch(error) {
-            this.app.addLog("Proxy server error at delete: "+error);
+            this.app.addLog("Proxy server error at delete: "+error, "error");
         }
 
         await this.container.kill();

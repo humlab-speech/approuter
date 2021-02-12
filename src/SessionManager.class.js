@@ -1,4 +1,5 @@
 const child_process = require('child_process');
+const nanoid = require('nanoid');
 const Session = require('./Session.class');
 const fetch = require('node-fetch');
 const { Docker } = require('node-docker-api');
@@ -10,7 +11,23 @@ class SessionManager {
       this.sessions = [];
       this.docker = new Docker({ socketPath: '/var/run/docker.sock' });
     }
+    
+    getContainerAccessCode() {
+      let code = nanoid.nanoid(32);
+      while(this.checkIfCodeIsUsed(code)) {
+        code = nanoid.nanoid(32);
+      }
+      return code;
+    }
 
+    checkIfCodeIsUsed(code) {
+      for(let key in this.sessions) {
+        if(this.sessions[key].accessCode == code) {
+          return true;
+        }
+      }
+      return false;
+    }
 
     getUserSessions(userId) {
       this.app.addLog("Getting user sessions for user "+userId);
@@ -65,7 +82,7 @@ class SessionManager {
             return false;
         }
         
-        this.app.addLog("REQ:",req.url);
+        this.app.addLog("REQ:"+req.url, "debug");
         
         if(ws) {
             this.app.addLog("Performing websocket routing");
@@ -76,7 +93,7 @@ class SessionManager {
             });
         }
         else {
-            this.app.addLog("Performing http routing");
+            this.app.addLog("Performing http routing", "debug");
             sess.proxyServer.web(req, res);
         }
     }
